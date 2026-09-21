@@ -1,0 +1,16 @@
+[
+	{
+		"modid": "torcherino",
+		"name": "加速火把",
+		"description": "添加强力加速火把的简单模组，支持加速格雷科技(GTCE)机器。",
+		"version": "7.6",
+		"mcversion": "1.11.2",
+		"url": "http://minecraft.curseforge.com/projects/torcherino",
+		"updateUrl": "",
+		"authorList": ["Moze_Intel", "sci4me", "NinjaPhenix1"],
+		"credits": "Moze Intel for 99.9% of the mod. sci4me for continuing the mod. NinjaPhenix1 for continuing the mod past 1.11.",
+		"logoFile": "",
+		"screenshots": [],
+		"dependencies": []
+	}
+]
