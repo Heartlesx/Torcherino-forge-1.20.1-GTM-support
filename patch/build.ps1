@@ -23,8 +23,11 @@ Write-Host '--- 1/5 compile stub ---'
 & $javac --release 8 -encoding UTF-8 -d $stubOut (Join-Path $patch 'stub\net\minecraft\util\ITickable.java')
 if ($LASTEXITCODE -ne 0) { throw 'stub compile failed' }
 
-Write-Host '--- 2/5 compile GTCECompat ---'
-& $javac --release 8 -encoding UTF-8 -cp $stubOut -d $hookOut (Join-Path $patch 'src\com\sci\torcherino\GTCECompat.java')
+Write-Host '--- 2/5 compile hook classes ---'
+# hook 现在可以直接按 SRG 名引用 MC/Forge（libs 下的 srg jar）以及被改造 mod 的公开成员
+$libJars = (Get-ChildItem -Recurse -Filter *.jar (Join-Path $root 'libs') | ForEach-Object { $_.FullName }) -join ';'
+$hookCp = "$stubOut;$libJars;" + (Join-Path $root 'torcherino-7.6.jar')
+& $javac --release 8 -encoding UTF-8 -cp $hookCp -d $hookOut (Get-ChildItem -Recurse -Filter *.java (Join-Path $patch 'src') | ForEach-Object { $_.FullName })
 if ($LASTEXITCODE -ne 0) { throw 'hook compile failed' }
 
 Write-Host '--- 3/5 compile Patcher ---'
@@ -46,20 +49,41 @@ if ($LASTEXITCODE -ne 0) { throw 'jar patch failed' }
 Write-Host '--- verify hook classes inside jar ---'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipCheck = [System.IO.Compression.ZipFile]::OpenRead($outJar)
-$hookEntries = $zipCheck.Entries | Where-Object { $_.FullName -like 'com/sci/torcherino/GTCECompat*' } | ForEach-Object { $_.FullName }
+$hookEntries = $zipCheck.Entries | Where-Object { $_.FullName -like 'com/sci/torcherino/*' } | ForEach-Object { $_.FullName }
 $zipCheck.Dispose()
 $hookEntries | ForEach-Object { Write-Host ("  " + $_) }
-if (-not ($hookEntries -contains 'com/sci/torcherino/GTCECompat$RecipeLogicAccess.class')) {
-    throw 'missing inner class com/sci/torcherino/GTCECompat$RecipeLogicAccess.class in jar'
+# 内层类缺失会导致运行期 NoClassDefFoundError -> 静默回退，所以逐个断言（历史踩坑 1）
+$required = @(
+    'com/sci/torcherino/GTCECompat.class',
+    'com/sci/torcherino/GTCECompat$RecipeLogicAccess.class',
+    'com/sci/torcherino/GTCECompat$ContainerOps.class',
+    'com/sci/torcherino/RangeValues.class',
+    'com/sci/torcherino/RangeValues$Bounds.class',
+    'com/sci/torcherino/RangeStore.class',
+    'com/sci/torcherino/RangeHooks.class',
+    'com/sci/torcherino/network/RangeUpdateMessage.class',
+    'com/sci/torcherino/network/RangeUpdateMessage$Handler.class',
+    'com/sci/torcherino/network/RangeUpdateMessage$Handler$1.class',
+    'com/sci/torcherino/network/RangeScreenMessage.class',
+    'com/sci/torcherino/network/RangeScreenMessage$Handler.class',
+    'com/sci/torcherino/client/RangeClient.class',
+    'com/sci/torcherino/client/RangeScreen.class',
+    'com/sci/torcherino/client/RangeClientHooks.class',
+    'com/sci/torcherino/client/RangeRenderer.class'
+)
+foreach ($needed in $required) {
+    if (-not ($hookEntries -contains $needed)) { throw ("missing class in jar: " + $needed) }
 }
 
 Write-Host '--- 5/5 offline hook test ---'
 & $javac --release 8 -encoding UTF-8 -cp $stubOut -d $fakeOut (Get-ChildItem -Recurse -Filter *.java (Join-Path $patch 'test\fake') | ForEach-Object { $_.FullName })
 if ($LASTEXITCODE -ne 0) { throw 'fake compile failed' }
-& $javac -encoding UTF-8 -cp "$stubOut;$outJar;$fakeOut" -d $testOut (Join-Path $patch 'test\HookTest.java')
+& $javac -encoding UTF-8 -cp "$stubOut;$outJar;$fakeOut" -d $testOut (Join-Path $patch 'test\HookTest.java') (Join-Path $patch 'test\RangeValuesTest.java')
 if ($LASTEXITCODE -ne 0) { throw 'test compile failed' }
-# run the test against the packaged jar (not the compile output) so missing inner classes are caught
+# run the tests against the packaged jar (not the compile output) so missing inner classes are caught
 & $java -cp "$stubOut;$outJar;$fakeOut;$testOut" HookTest
 if ($LASTEXITCODE -ne 0) { throw 'hook test failed' }
+& $java -cp "$stubOut;$outJar;$fakeOut;$testOut" RangeValuesTest
+if ($LASTEXITCODE -ne 0) { throw 'range test failed' }
 
 Write-Host "BUILD OK -> $outJar"

@@ -8,6 +8,7 @@ import gregtech.api.capability.impl.FakeGtLiteFuelRecipeLogic;
 import gregtech.api.capability.impl.FakePlainEnergyContainer;
 import gregtech.api.metatileentity.MetaTileEntity;
 import gregtech.api.metatileentity.MetaTileEntityHolder;
+import gregtech.common.metatileentities.multi.electric.MetaTileEntityFluidDrill;
 import net.minecraft.util.ITickable;
 
 /**
@@ -32,6 +33,10 @@ public class HookTest {
         testFullBufferStillFlushesWithoutInjecting();
         testMultiblockStyleContainerStillBoosts();
         testUnknownContainerDisablesBoost();
+        testFluidDrillAcceleratesWithoutExtraEnergy();
+        testFluidDrillFallsBackWhenStructureUnformed();
+        testFluidDrillKeepsProgressWhenNoEnergy();
+        testFluidDrillWithoutReadableEnergyIsNotAccelerated();
         testBoilerStyleFallsBackToMachineUpdate();
         System.out.println("ALL TESTS PASSED (" + checks + " checks)");
     }
@@ -152,6 +157,65 @@ public class HookTest {
         GTCECompat.tickTile(f.holder);
         check("unknown container: machine update skipped", f.holder.updateCalls == 0);
         check("unknown container: no injection", logic.energyOutputs == 0);
+    }
+
+    private static void testFluidDrillAcceleratesWithoutExtraEnergy() {
+        MetaTileEntityFluidDrill drill = new MetaTileEntityFluidDrill();
+        FakeEnergyContainer container = new FakeEnergyContainer();
+        container.stored = 1000L;
+        drill.setEnergyContainer(container);
+        MetaTileEntityHolder holder = new MetaTileEntityHolder();
+        holder.setMetaTileEntity(drill);
+
+        GTCECompat.tickTile(holder);
+        check("drill: machine update skipped", holder.updateCalls == 0);
+        check("drill: one drilling tick", drill.getMinerLogic().drillingCalls == 1);
+        check("drill: progress advanced", drill.getMinerLogic().progressTime == 1);
+        check("drill: extra tick costs no energy", container.stored == 1000L);
+
+        for (int i = 0; i < 19; i++) {
+            GTCECompat.tickTile(holder);
+        }
+        check("drill: 20 drilling ticks reached", drill.getMinerLogic().drillingCalls == 20);
+        check("drill: progress wrapped to 0", drill.getMinerLogic().progressTime == 0);
+        check("drill: still no energy spent", container.stored == 1000L);
+    }
+
+    private static void testFluidDrillFallsBackWhenStructureUnformed() {
+        MetaTileEntityFluidDrill drill = new MetaTileEntityFluidDrill();
+        drill.structureFormed = false;
+        MetaTileEntityHolder holder = new MetaTileEntityHolder();
+        holder.setMetaTileEntity(drill);
+
+        GTCECompat.tickTile(holder);
+        check("unformed drill: falls back to machine update", holder.updateCalls == 1);
+        check("unformed drill: no drilling tick", drill.getMinerLogic().drillingCalls == 0);
+    }
+
+    private static void testFluidDrillKeepsProgressWhenNoEnergy() {
+        MetaTileEntityFluidDrill drill = new MetaTileEntityFluidDrill();
+        FakeEnergyContainer container = new FakeEnergyContainer();
+        container.stored = 0L; // 真的没电：由机器自身逻辑决定停机
+        drill.setEnergyContainer(container);
+        MetaTileEntityHolder holder = new MetaTileEntityHolder();
+        holder.setMetaTileEntity(drill);
+
+        GTCECompat.tickTile(holder);
+        check("powerless drill: machine update skipped", holder.updateCalls == 0);
+        check("powerless drill: drilling tick still runs", drill.getMinerLogic().drillingCalls == 1);
+        check("powerless drill: progress not advanced", drill.getMinerLogic().progressTime == 0);
+        check("powerless drill: no energy created", container.stored == 0L);
+    }
+
+    private static void testFluidDrillWithoutReadableEnergyIsNotAccelerated() {
+        MetaTileEntityFluidDrill drill = new MetaTileEntityFluidDrill();
+        drill.setEnergyContainer(new FakePlainEnergyContainer()); // 读不到/改不了能量
+        MetaTileEntityHolder holder = new MetaTileEntityHolder();
+        holder.setMetaTileEntity(drill);
+
+        GTCECompat.tickTile(holder);
+        check("drill without energy ops: machine update skipped", holder.updateCalls == 0);
+        check("drill without energy ops: no drilling tick", drill.getMinerLogic().drillingCalls == 0);
     }
 
     private static void testBoilerStyleFallsBackToMachineUpdate() {

@@ -13,15 +13,18 @@ import net.minecraft.util.ITickable;
  * GTCE(GregTech 1.12.2) 兼容层，由 Torcherino 的字节码补丁在额外 tick 循环中调用。
  *
  * 对标准配方机器：不执行整机 tick，只接管“每 tick 的行为”：
- * - 耗能机器（consumesEnergy() == true）：推进配方进度，不消耗 EU。
+ * - 耗能机器（consumesEnergy() == true）：推进配方进度，不消耗 EU（EU 消耗保持 1x）。
  * - 发电机（consumesEnergy() == false）：不推进燃烧进度（燃料消耗保持原速），额外输出一份 EU，
  *   并立刻驱动能量容器向电网推送，避免内部缓冲被灌满导致燃烧进度卡死。
+ * - 流体钻机（MetaTileEntityFluidDrill）：其每 tick 逻辑是独立的 FluidDrillLogic，不是
+ *   AbstractRecipeLogic，拿不到配方逻辑句柄；因此保留它自己的行为（矿区判定、储罐满暂停、
+ *   缺电衰减等），只把额外 tick 多扣的能量退还，使 EU 消耗保持 1x。
  * - 其他方块实体（非 GTCE、锅炉、自定义 drawEnergy 的机器、反射失败等）：维持原版完整 tick。
  *
  * 注意：部分整合包(如 GT Lite 的 gtlitecore)会用 Mixin 覆盖 FuelRecipeLogic.updateRecipeProgress，
  * 因此发电机判定不依赖 updateRecipeProgress 的声明类，只看 consumesEnergy() 与 drawEnergy()。
  *
- * 全部通过反射访问 GTCE 类，GTCE 为可选依赖。诊断日志以 [Torcherino-GTCE] 前缀输出，每类只打一次。
+ * 全部通过反射访问 GTCE 类，GTCE 为可选依赖。诊断日志以 [Torcherino-GTCE] 前缀输出，每种逻辑只打一次。
  */
 public final class GTCECompat {
 
@@ -32,12 +35,23 @@ public final class GTCECompat {
     private static final Method GET_META_TILE_ENTITY = findMethod(META_TILE_ENTITY_HOLDER, "getMetaTileEntity");
     private static final Method GET_RECIPE_LOGIC = findMethod(META_TILE_ENTITY, "getRecipeLogic");
 
+    /** 流体钻机：每 tick 逻辑是独立的 FluidDrillLogic（非 AbstractRecipeLogic），需要单独接管。 */
+    private static final Class<?> FLUID_DRILL = loadClass("gregtech.common.metatileentities.multi.electric.MetaTileEntityFluidDrill");
+    private static final Field FLUID_DRILL_LOGIC = findField(FLUID_DRILL, "minerLogic");
+    private static final Field FLUID_DRILL_ENERGY = findField(FLUID_DRILL, "energyContainer");
+    private static final Method FLUID_DRILL_FORMED = findMethod(FLUID_DRILL, "isStructureFormed");
+    private static final Method PERFORM_DRILLING = findMethod(
+            loadClass("gregtech.api.capability.impl.FluidDrillLogic"), "performDrilling");
+
     /** 配方逻辑类的反射句柄缓存；解析失败时存放 FAILED 哨兵，避免反复重试。 */
     private static final ConcurrentHashMap<Class<?>, Object> RECIPE_LOGIC_ACCESS = new ConcurrentHashMap<Class<?>, Object>();
     private static final Object FAILED = new Object();
 
     /** 能量容器的“立即输出”策略缓存：Method(update) 或 Field(List<IEnergyContainer>)；不支持时存放 UNSUPPORTED。 */
     private static final ConcurrentHashMap<Class<?>, Object> FLUSH_CACHE = new ConcurrentHashMap<Class<?>, Object>();
+
+    /** 能量容器的读写句柄缓存。 */
+    private static final ConcurrentHashMap<Class<?>, Object> CONTAINER_OPS = new ConcurrentHashMap<Class<?>, Object>();
     private static final Object UNSUPPORTED = new Object();
 
     /** 诊断日志去重集合。 */
@@ -72,9 +86,13 @@ public final class GTCECompat {
             if (metaTileEntity == null) {
                 return true; // 机器尚未加载完成：跳过额外 tick，交给世界正常 tick 处理
             }
+            if (FLUID_DRILL_LOGIC != null && FLUID_DRILL.isInstance(metaTileEntity)) {
+                return accelerateFluidDrill(metaTileEntity);
+            }
             Object recipeLogic = GET_RECIPE_LOGIC.invoke(metaTileEntity);
             if (recipeLogic == null) {
-                logOnce("no-recipe-logic", "no recipe logic on " + metaTileEntity.getClass().getName());
+                logOnce("no-recipe-logic-" + metaTileEntity.getClass().getName(),
+                        "no recipe logic on " + metaTileEntity.getClass().getName());
                 return false; // 没有配方逻辑：维持原版行为
             }
             return advance(recipeLogic);
@@ -109,18 +127,18 @@ public final class GTCECompat {
             return false; // 自定义推进逻辑（如研究站）：维持原版完整 tick
         }
         if (!logic.isWorking(recipeLogic)) {
-            return true; // 未在运行配方：跳过额外 tick
+            return true; // 未运行（无配方/停机/缺电）：跳过额外 tick，等正常 tick 处理
         }
         if (!logic.canRecipeProgress(recipeLogic)) {
             return true; // 当前配方不允许推进（如清洁室/结构条件不满足）
         }
+        int progress = logic.progressTime.getInt(recipeLogic);
+        if (progress <= 0) {
+            return true; // 没有配方在跑：跳过额外 tick，等正常 tick 搜索新配方
+        }
         int maxProgress = logic.maxProgressTime.getInt(recipeLogic);
         if (maxProgress <= 0) {
             return true; // 没有有效配方
-        }
-        int progress = logic.progressTime.getInt(recipeLogic);
-        if (progress <= 0) {
-            return true; // 尚未开始推进
         }
         int next = progress + 1;
         logic.progressTime.setInt(recipeLogic, next);
@@ -130,6 +148,51 @@ public final class GTCECompat {
         logOnce("advance-" + recipeLogic.getClass().getName(),
                 "progress acceleration active for " + recipeLogic.getClass().getName());
         return true;
+    }
+
+    /**
+     * 流体钻机专用路径。
+     *
+     * 钻机的每 tick 行为（耗电、进度推进、矿区枯竭判定、储罐满暂停、缺电衰减）都在 FluidDrillLogic 里，
+     * 与 AbstractRecipeLogic 无关，因此这里保留它自己的行为，只把额外 tick 多扣掉的那份能量退还，
+     * 使 EU 消耗保持 1x（正常 tick 的那一份照付）。
+     */
+    private static boolean accelerateFluidDrill(Object metaTileEntity) {
+        try {
+            if (PERFORM_DRILLING == null) {
+                return false;
+            }
+            if (FLUID_DRILL_FORMED != null && !((Boolean) FLUID_DRILL_FORMED.invoke(metaTileEntity)).booleanValue()) {
+                return false; // 结构未成型：维持原版行为
+            }
+            Object minerLogic = FLUID_DRILL_LOGIC.get(metaTileEntity);
+            if (minerLogic == null) {
+                return false;
+            }
+            Object container = FLUID_DRILL_ENERGY == null ? null : FLUID_DRILL_ENERGY.get(metaTileEntity);
+            Object opsRaw = container == null ? UNSUPPORTED : resolveContainerOps(container.getClass());
+            if (opsRaw == UNSUPPORTED) {
+                // 读不到/改不了能量容器就无法退还额外耗电：宁可不加速，也不让机器退回 ×N 耗电
+                logOnce("drill-no-energy-ops-" + metaTileEntity.getClass().getName(),
+                        "fluid drill acceleration disabled for " + metaTileEntity.getClass().getName()
+                                + ": energy container not readable");
+                return true;
+            }
+            ContainerOps ops = (ContainerOps) opsRaw;
+            long before = ops.getEnergyStored(container);
+            PERFORM_DRILLING.invoke(minerLogic);
+            long after = ops.getEnergyStored(container);
+            if (after < before) {
+                ops.changeEnergy(container, before - after);
+            }
+            logOnce("drill-" + metaTileEntity.getClass().getName(),
+                    "fluid drill acceleration active for " + metaTileEntity.getClass().getName()
+                            + " (energy cost kept at 1x)");
+            return true;
+        } catch (Throwable failure) {
+            logOnce("drill-error-" + failure.getClass().getName(), "fluid drill failure: " + failure);
+            return false; // 反射失败：维持原版行为
+        }
     }
 
     /**
@@ -232,6 +295,43 @@ public final class GTCECompat {
         }
     }
 
+    private static Object resolveContainerOps(Class<?> containerClass) {
+        Object cached = CONTAINER_OPS.get(containerClass);
+        if (cached != null) {
+            return cached;
+        }
+        Object created = createContainerOps(containerClass);
+        Object raced = CONTAINER_OPS.putIfAbsent(containerClass, created == null ? UNSUPPORTED : created);
+        return raced != null ? raced : (created == null ? UNSUPPORTED : created);
+    }
+
+    private static Object createContainerOps(Class<?> containerClass) {
+        Method getEnergyStored = findMethod(containerClass, "getEnergyStored");
+        Method changeEnergy = findMethod(containerClass, "changeEnergy", long.class);
+        if (getEnergyStored == null || changeEnergy == null) {
+            return null;
+        }
+        return new ContainerOps(getEnergyStored, changeEnergy);
+    }
+
+    private static final class ContainerOps {
+        final Method getEnergyStored;
+        final Method changeEnergy;
+
+        ContainerOps(Method getEnergyStored, Method changeEnergy) {
+            this.getEnergyStored = getEnergyStored;
+            this.changeEnergy = changeEnergy;
+        }
+
+        long getEnergyStored(Object container) throws Exception {
+            return ((Long) getEnergyStored.invoke(container)).longValue();
+        }
+
+        long changeEnergy(Object container, long amount) throws Exception {
+            return ((Long) changeEnergy.invoke(container, Long.valueOf(amount))).longValue();
+        }
+    }
+
     private static void logOnce(String key, String message) {
         try {
             if (LOGGED.add(key)) {
@@ -295,7 +395,8 @@ public final class GTCECompat {
                 // canRecipeProgress 为可选字段，缺失时不做该检查
                 Field canRecipeProgress = findField(logicClass, "canRecipeProgress");
                 return new RecipeLogicAccess(isWorking, consumesEnergy, completeRecipe, drawEnergy, getEnergyContainer,
-                        progressTime, maxProgressTime, canRecipeProgress, recipeEUt, usesStandardProgress, standardDrawEnergy);
+                        progressTime, maxProgressTime, canRecipeProgress, recipeEUt,
+                        usesStandardProgress, standardDrawEnergy);
             } catch (Throwable failure) {
                 return null;
             }
